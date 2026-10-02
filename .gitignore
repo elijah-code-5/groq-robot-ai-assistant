@@ -1,0 +1,10 @@
+# Default ignores for a local ESP32 project
+
+.vscode/
+.DS_Store
+*.bin
+*.elf
+*.hex
+*.log
+build/
+.pio/
