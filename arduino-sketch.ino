@@ -1,7 +1,7 @@
 // ============================================================================
 // Groq Robot Alarm Clock + AI Assistant
-// ESP32-WROOM-32 + Freenove 4WD Car Kit + JBL Go 4 Bluetooth Speaker
-// Full Arduino sketch with Groq API integration
+// ESP32-WROOM-32 + Freenove 4WD Car Kit + Bluetooth Speaker
+// Clean, working Arduino sketch
 // ============================================================================
 
 #include <WiFi.h>
@@ -16,6 +16,18 @@
 #include "AudioTools/AudioCodecs/CodecMP3Helix.h"
 #include "Freenove_4WD_Car_For_ESP32.h"
 
+#if __has_include("AudioTools/Communication/A2DPStream.h")
+  #include "AudioTools/Communication/A2DPStream.h"
+#elif __has_include("AudioTools/AudioLibs/A2DPStream.h")
+  #include "AudioTools/AudioLibs/A2DPStream.h"
+#endif
+
+#if __has_include("AudioTools/Communication/AudioHttp.h")
+  #include "AudioTools/Communication/AudioHttp.h"
+#elif __has_include("AudioTools/AudioLibs/AudioHttp.h")
+  #include "AudioTools/AudioLibs/AudioHttp.h"
+#endif
+
 // ========== CONFIGURATION ==========
 const char* WIFI_SSID = "YOUR_WIFI_SSID";
 const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
@@ -23,27 +35,9 @@ const char* BT_SPEAKER = "JBL Go 4";
 const char* GROQ_API_KEY = "gsk_YOUR_KEY_HERE";
 const char* GROQ_MODEL = "llama-3.3-70b-versatile";
 
-#define REQUIRE_LOGIN 0
-const char* WEB_USER = "admin";
-const char* WEB_PASS = "change-me";
-
-const long GMT_OFFSET_S = 18000; // UTC+5
-
-const char* SEED_PODCAST_NAME = "Podcast 1";
-const char* SEED_PODCAST_URL = "https://dcs-cached.megaphone.fm/ARML4940363433.mp3";
-
-#define ENABLE_GROQ_TTS 1
-#define ENABLE_TTS 0
-const char* WIT_TOKEN = "";
-const char* WIT_VOICE = "Rebecca";
-
-#define STOP_BTN_PIN 0
-#define BT_PREWARM_MIN 2
+#define GMT_OFFSET_S 18000
 #define DRIVE_SPEED 2000
 #define DRIVE_MS 2000
-#define ALARM_MAX_MS (15UL * 60UL * 1000UL)
-
-// ========== CONSTANTS ==========
 #define MAX_ALARMS 5
 #define MAX_PODCASTS 10
 #define LOG_N 10
@@ -63,23 +57,21 @@ bool audioReady = false;
 int pendingPod = -1;
 unsigned long pendingSince = 0;
 
-enum Stage { IDLE, TTS, PODCAST, WAITBT };
+enum Stage { IDLE, PODCAST, WAITBT };
 Stage stage = IDLE;
-int wantPod = -1;
 bool gotAny = false;
 unsigned long lastData = 0;
-unsigned long alarmStart = 0;
-
-unsigned long countdownEnd = 0;
-bool timerActive = false;
 
 String logLines[LOG_N];
 int logN = 0;
 
-struct Podcast { char name[32]; char url[256]; };
+struct Podcast { 
+  char name[32]; 
+  char url[256]; 
+};
 Podcast pods[MAX_PODCASTS];
 
-enum { MODE_OFF = 0, MODE_ONCE, MODE_DAILY, MODE_WEEKDAYS, MODE_MON_SAT };
+enum AlarmMode { MODE_OFF = 0, MODE_ONCE, MODE_DAILY, MODE_WEEKDAYS, MODE_MON_SAT };
 const char* MODE_NAMES[] = { "Off", "Once", "Every day", "Mon-Fri", "Mon-Sat" };
 
 struct Alarm {
@@ -92,20 +84,22 @@ struct Alarm {
 Alarm alarms[MAX_ALARMS];
 int32_t lastFired[MAX_ALARMS];
 
-// ========== HELPER FUNCTIONS ==========
+// ========== HELPERS ==========
 String toLower(const String& s) {
   String result = s;
-  for (int i = 0; i < result.length(); i++) result[i] = tolower((unsigned char)result[i]);
+  for (int i = 0; i < result.length(); i++) {
+    result[i] = tolower((unsigned char)result[i]);
+  }
   return result;
 }
 
 String esc(const char* s) {
   String o;
   for (; *s; s++) {
-    if (*s == '<') o += "&lt;"; 
+    if (*s == '<') o += "&lt;";
     else if (*s == '>') o += "&gt;";
-    else if (*s == '&') o += "&amp;"; 
-    else if (*s == '"') o += "&quot;"; 
+    else if (*s == '&') o += "&amp;";
+    else if (*s == '"') o += "&quot;";
     else o += *s;
   }
   return o;
@@ -119,7 +113,6 @@ String escapeJson(const String& input) {
     else if (c == '"') out += "\\\"";
     else if (c == '\n') out += "\\n";
     else if (c == '\r') out += "\\r";
-    else if (c == '\t') out += "\\t";
     else out += c;
   }
   return out;
@@ -140,7 +133,7 @@ void notef(const char* fmt, ...) {
   note(String(b));
 }
 
-// ========== MOTOR CONTROL ==========
+// ========== MOTOR ==========
 void drive(int speed) {
   Motor_Move(speed, speed, speed, speed);
   driving = (speed != 0);
@@ -152,11 +145,7 @@ void motorStop() {
   driving = false;
 }
 
-void motorMove(int d1, int d2, int d3, int d4) {
-  Motor_Move(d1, d2, d3, d4);
-}
-
-// ========== STORAGE FUNCTIONS ==========
+// ========== STORAGE ==========
 void savePods() {
   prefs.begin("pods", false);
   prefs.putBytes("p", pods, sizeof(pods));
@@ -171,8 +160,8 @@ void loadPods() {
   if (ok) prefs.getBytes("p", pods, sizeof(pods));
   prefs.end();
   if (!ok) {
-    strlcpy(pods[0].name, SEED_PODCAST_NAME, sizeof(pods[0].name));
-    strlcpy(pods[0].url, SEED_PODCAST_URL, sizeof(pods[0].url));
+    strlcpy(pods[0].name, "Podcast 1", sizeof(pods[0].name));
+    strlcpy(pods[0].url, "https://dcs-cached.megaphone.fm/ARML4940363433.mp3", sizeof(pods[0].url));
     savePods();
   }
 }
@@ -209,7 +198,7 @@ bool dayMatches(uint8_t mode, int wday) {
   }
 }
 
-// ========== AUDIO SYSTEM ==========
+// ========== AUDIO ==========
 int btConnState() {
   if (!audioReady || !a2dp) return 0;
   auto src = a2dp->source();
@@ -219,7 +208,7 @@ int btConnState() {
 
 bool ensureAudio() {
   if (audioReady) return true;
-  notef("Starting BT. Looking for '%s'. heap=%u", BT_SPEAKER, ESP.getFreeHeap());
+  notef("Starting BT. heap=%u", ESP.getFreeHeap());
   a2dp = new A2DPStream();
   auto cfg = a2dp->defaultConfig(TX_MODE);
   cfg.name = BT_SPEAKER;
@@ -229,7 +218,6 @@ bool ensureAudio() {
   podUrl = new URLStream();
   podCopier = new StreamCopy(*decoder, *podUrl, 1024);
   audioReady = true;
-  note("Bluetooth started, searching for speaker...");
   return true;
 }
 
@@ -241,16 +229,15 @@ void stopAll() {
   stage = IDLE;
   pendingPod = -1;
   motorStop();
-  driving = false;
   note("Stopped");
 }
 
 void beginPodcastNow(int idx) {
-  notef("Opening: %s (heap %u)", pods[idx].name, ESP.getFreeHeap());
+  notef("Opening: %s", pods[idx].name);
   bool ok = podUrl->begin(pods[idx].url, "audio/mpeg");
   if (!ok && strncmp(pods[idx].url, "https://", 8) == 0) {
     String alt = String("http://") + (pods[idx].url + 8);
-    note("https failed, trying http...");
+    note("Trying http...");
     podUrl->end();
     ok = podUrl->begin(alt.c_str(), "audio/mpeg");
   }
@@ -263,12 +250,12 @@ void beginPodcastNow(int idx) {
   stage = PODCAST;
   gotAny = false;
   lastData = millis();
-  note("Stream opened, waiting for audio...");
+  note("Stream opened");
 }
 
 void startPodcastStage(int idx) {
   if (idx < 0 || idx >= MAX_PODCASTS || strlen(pods[idx].url) < 8) {
-    note("No URL in podcast slot");
+    note("No URL");
     stopAll();
     return;
   }
@@ -279,64 +266,48 @@ void startPodcastStage(int idx) {
   note("Waiting for speaker...");
 }
 
-void speakThenPlay(const String& text, int pod) {
-  if (stage != IDLE) stopAll();
-  wantPod = pod;
-  alarmStart = millis();
-  note("Voice: " + text);
-  if (pod >= 0) startPodcastStage(pod);
-}
-
 void fireAlarm(int idx, const struct tm& t) {
   Alarm& a = alarms[idx];
-  notef("ALARM #%d fired", idx + 1);
+  notef("ALARM #%d", idx + 1);
   if (a.roll) drive(DRIVE_SPEED);
   char tb[16];
   strftime(tb, sizeof(tb), "%I:%M %p", &t);
-  String text = String("Good morning. Time is ") + tb + ". " + a.msg;
-  speakThenPlay(text, a.podcast ? (int)a.podIdx : -1);
+  note(String("Good morning. Time is ") + tb + ". " + a.msg);
+  if (a.podcast) startPodcastStage(a.podIdx);
   if (a.mode == MODE_ONCE) {
     a.enabled = false;
     saveAlarms();
   }
 }
 
-// ========== GROQ API INTEGRATION ==========
+// ========== GROQ API ==========
 String askGroq(const String& userText) {
-  if (strlen(GROQ_API_KEY) < 10) {
-    return "Groq API key missing";
-  }
-
-  String prompt = "You are a helpful robot assistant. Keep answers short and practical. User: " + userText;
+  if (strlen(GROQ_API_KEY) < 10) return "No API key";
 
   WiFiClientSecure client;
   client.setInsecure();
-
   HTTPClient http;
+  
   if (!http.begin(client, "https://api.groq.com/openai/v1/chat/completions")) {
-    return "Could not connect to Groq.";
+    return "Connection failed";
   }
 
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", String("Bearer ") + GROQ_API_KEY);
 
-  String body = "{";
-  body += "\"model\":\"" + String(GROQ_MODEL) + "\",";
+  String body = "{\"model\":\"" + String(GROQ_MODEL) + "\",";
   body += "\"messages\":[";
-  body += "{\"role\":\"system\",\"content\":\"You are a robot assistant. Keep answers brief.\"},";
-  body += "{\"role\":\"user\",\"content\":\"" + escapeJson(prompt) + "\"}";
-  body += "],";
-  body += "\"temperature\":0.7,";
-  body += "\"max_tokens\":250";
-  body += "}";
+  body += "{\"role\":\"system\",\"content\":\"You are a helpful robot assistant. Keep answers brief.\"},";
+  body += "{\"role\":\"user\",\"content\":\"" + escapeJson(userText) + "\"}";
+  body += "],\"temperature\":0.7,\"max_tokens\":200}";
 
   int httpCode = http.POST(body);
   String payload = http.getString();
   http.end();
 
-  if (httpCode != HTTP_CODE_OK) {
+  if (httpCode != 200) {
     notef("Groq HTTP %d", httpCode);
-    return "Groq request failed";
+    return "API error";
   }
 
   int start = payload.indexOf("\"content\":\"");
@@ -344,9 +315,11 @@ String askGroq(const String& userText) {
   start += 11;
 
   int end = payload.indexOf("\"", start);
-  if (end < 0) return "Malformed response";
+  if (end < 0) return "Parse error";
 
   String result = payload.substring(start, end);
+  
+  // Unescape JSON
   String clean = "";
   for (size_t i = 0; i < result.length(); i++) {
     if (result[i] == '\\' && i + 1 < result.length()) {
@@ -360,139 +333,66 @@ String askGroq(const String& userText) {
       clean += result[i];
     }
   }
-
   clean.trim();
   return clean.length() > 0 ? clean : "No answer";
 }
 
-// ========== VOICE COMMAND PROCESSING ==========
+// ========== VOICE COMMANDS ==========
 void processVoiceCommand(const String& command) {
   String cmd = command;
   cmd.trim();
   String cmdLower = toLower(cmd);
 
-  size_t pos = cmdLower.indexOf("hey robot");
-  if (pos != -1) cmdLower = cmdLower.substring(pos + 10);
-  pos = cmdLower.indexOf("ok robot");
-  if (pos != -1) cmdLower = cmdLower.substring(pos + 9);
-  cmdLower.trim();
-
-  if (cmdLower.indexOf("go") != -1 || cmdLower.indexOf("forward") != -1) {
+  if (cmdLower.indexOf("forward") >= 0 || cmdLower.indexOf("go") >= 0) {
     drive(DRIVE_SPEED);
     note("Voice: Forward");
     return;
   }
-  if (cmdLower.indexOf("back") != -1 || cmdLower.indexOf("backward") != -1) {
+  if (cmdLower.indexOf("back") >= 0) {
     drive(-DRIVE_SPEED);
-    note("Voice: Backward");
+    note("Voice: Back");
     return;
   }
-  if (cmdLower.indexOf("left") != -1) {
+  if (cmdLower.indexOf("left") >= 0) {
     Motor_Move(-DRIVE_SPEED, -DRIVE_SPEED, DRIVE_SPEED, DRIVE_SPEED);
     driving = true;
     driveStart = millis();
     note("Voice: Left");
     return;
   }
-  if (cmdLower.indexOf("right") != -1) {
+  if (cmdLower.indexOf("right") >= 0) {
     Motor_Move(DRIVE_SPEED, DRIVE_SPEED, -DRIVE_SPEED, -DRIVE_SPEED);
     driving = true;
     driveStart = millis();
     note("Voice: Right");
     return;
   }
-  if (cmdLower.indexOf("stop") != -1 || cmdLower.indexOf("halt") != -1) {
+  if (cmdLower.indexOf("stop") >= 0) {
     stopAll();
     note("Voice: Stopped");
     return;
   }
-  if (cmdLower.indexOf("play") != -1 && cmdLower.indexOf("podcast") != -1) {
-    for (int i = 0; i < MAX_PODCASTS; i++) {
-      if (strlen(pods[i].url) > 0) {
-        String podName = toLower(String(pods[i].name));
-        if (cmdLower.indexOf(podName) != -1 || cmdLower.indexOf(String(i+1)) != -1) {
-          if (stage != IDLE) stopAll();
-          startPodcastStage(i);
-          notef("Voice: Podcast %d", i+1);
-          return;
-        }
-      }
-    }
-    if (strlen(pods[0].url) > 0) {
-      if (stage != IDLE) stopAll();
-      startPodcastStage(0);
-      note("Voice: Playing podcast");
-    }
-    return;
-  }
-  if (cmdLower.indexOf("what time") != -1) {
-    struct tm t;
-    if (getLocalTime(&t, 10)) {
-      char tb[16];
-      strftime(tb, sizeof(tb), "%I:%M %p", &t);
-      note("Voice: Time is " + String(tb));
-    } else {
-      note("Voice: Time unavailable");
-    }
+  if (cmdLower.indexOf("podcast") >= 0 || cmdLower.indexOf("music") >= 0) {
+    if (stage != IDLE) stopAll();
+    startPodcastStage(0);
+    note("Voice: Podcast");
     return;
   }
 
-  // Send to Groq for general queries
   String answer = askGroq(command);
   note("AI: " + answer);
 }
 
-// ========== WEB INTERFACE ==========
-bool auth() {
-#if REQUIRE_LOGIN
-  if (!server.authenticate(WEB_USER, WEB_PASS)) {
-    server.requestAuthentication();
-    return false;
-  }
-#endif
-  return true;
-}
-
-String podOptions(int sel) {
-  String o;
-  for (int i = 0; i < MAX_PODCASTS; i++) {
-    if (strlen(pods[i].url) < 8) continue;
-    o += "<option value=" + String(i) + (i == sel ? " selected>" : ">") + esc(pods[i].name) + "</option>";
-  }
-  return o;
-}
-
-void redirectHome() {
-  if (server.hasArg("x")) {
-    server.send(200, "text/plain", "ok");
-    return;
-  }
-  server.sendHeader("Location", "/");
-  server.send(303);
-}
-
-const char* stateName() {
-  switch (stage) {
-    case TTS: return "speaking";
-    case PODCAST: return "playing";
-    case WAITBT: return "connecting";
-    default: return "idle";
-  }
-}
-
-const char* speakerName() {
-  if (!audioReady) return "off";
-  int c = btConnState();
-  return c == 1 ? "connected" : "searching";
-}
-
+// ========== WEB ==========
 void handleStatus() {
   struct tm t;
   char tb[24] = "syncing";
   if (getLocalTime(&t, 10)) strftime(tb, sizeof(tb), "%a %H:%M:%S", &t);
-  String j = String("{\"time\":\"") + tb + "\",\"state\":\"" + stateName() +
-             "\",\"speaker\":\"" + speakerName() +
-             "\",\"heap\":" + String(ESP.getFreeHeap()) + ",\"log\":[";
+  
+  String j = "{\"time\":\"" + String(tb) + "\",\"state\":\"";
+  j += (stage == PODCAST ? "playing" : "idle");
+  j += "\",\"log\":[";
+  
   int n = logN < LOG_N ? logN : LOG_N;
   for (int k = 1; k <= n; k++) {
     String m = logLines[(logN - k) % LOG_N];
@@ -504,120 +404,120 @@ void handleStatus() {
   server.send(200, "application/json", j);
 }
 
-const char PAGE_HEAD[] PROGMEM = R"rawliteral(<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Robot Assistant v8</title>
-<style>:root{--bg:#0f1420;--card:#192032;--text:#e6ebf5;--accent:#4f8cff;--ok:#2ecc71;--bad:#ff4d5e;--line:#2a3450;--input:#0f1626}
-html[data-theme=light]{--bg:#f2f4f9;--card:#fff;--text:#1b2233;--accent:#2f6bff;--ok:#1a9c52;--bad:#d9303f;--line:#d7dcea;--input:#f7f8fc}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.4 system-ui,sans-serif}.wrap{max-width:700px;margin:auto;padding:14px}
-h1{font-size:20px;margin:0}h3{margin:0 0 10px;font-size:13px;color:#8d99b3;text-transform:uppercase}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}
-.chips{display:flex;flex-wrap:wrap;gap:6px}.chip{background:var(--input);border:1px solid var(--line);border-radius:999px;padding:4px 10px;font-size:13px}
-button{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:10px 14px;cursor:pointer}button.alt{background:var(--input);color:var(--text);border:1px solid var(--line)}
-.stop{background:var(--bad);width:100%;font-size:20px;padding:14px;margin:12px 0 0}
-.pad{display:grid;grid-template-columns:repeat(3,76px);gap:8px;justify-content:center}
-.pad button{margin:0;font-size:28px;padding:0}
-input,select{background:var(--input);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px;width:100%;margin:4px 0}
-#log{font:12px/1.6 monospace;color:#8d99b3;white-space:pre-wrap;word-break:break-word}
-#voiceInput{width:100%;padding:10px;margin:4px 0}</style></head><body><div class="wrap">
-<h1>🤖 Robot Assistant v8</h1>
-<div class="card"><div class="chips"><span class="chip">Time <b id="t">--</b></span><span class="chip">State <b id="st">--</b></span>
-<span class="chip">Speaker <b id="sp">--</b></span><span class="chip">Mem <b id="hp">--</b></span></div></div>)rawliteral";
-
-const char PAGE_END[] PROGMEM = R"rawliteral(
-<div class="card"><h3>Voice</h3>
-<input type="text" id="voiceInput" placeholder="Ask anything..."><button onclick="sendVoice()">Send</button></div>
-
-<div class="card"><h3>Drive</h3>
-<div class="pad">
-<span></span><button data-d="f">▲</button><span></span>
-<button data-d="l">◀</button><button data-d="s" class="alt">■</button><button data-d="r">▶</button>
-<span></span><button data-d="b">▼</button><span></span>
-</div>
-<button class="stop" id="stop">STOP</button></div>
-
-<div class="card"><h3>Podcast</h3>
-<select id="podSel"></select><button onclick="playPod()">Play</button></div>
-
-<div class="card"><h3>Log</h3><div id="log">...</div></div></div>
-<script>
-const $=s=>document.querySelector(s);
-function cmd(u){fetch(u+'&x=1').then(r=>r.text()).catch(e=>console.log(e))}
-document.querySelectorAll('.pad button').forEach(b=>{const d=b.dataset.d;
-b.addEventListener('pointerdown',e=>{e.preventDefault();cmd('/drive?d='+d)});
-if(d!='s'){['pointerup','pointerleave'].forEach(ev=>b.addEventListener(ev,()=>cmd('/drive?d=s')))}});
-$('#stop').onclick=()=>cmd('/stop');
-function sendVoice(){const v=$('#voiceInput').value;if(v){fetch('/voice?cmd='+encodeURIComponent(v)+'&x=1').then(r=>r.text());$('#voiceInput').value=''}}
-$('#voiceInput').addEventListener('keypress',e=>{if(e.key==='Enter'){e.preventDefault();sendVoice()}});
-function poll(){fetch('/status').then(r=>r.json()).then(s=>{$('#t').textContent=s.time;$('#st').textContent=s.state;$('#sp').textContent=s.speaker;$('#hp').textContent=Math.round(s.heap/1024)+' KB';$('#log').textContent=s.log.join('\\n')})}
-poll();setInterval(poll,2000);
-function playPod(){const s=$('#podSel').value;if(s){cmd('/play?p='+s)}}
-</script></body></html>)rawliteral";
-
 void handleRoot() {
-  if (!auth()) return;
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "text/html", "");
-  server.sendContent(PAGE_HEAD);
+  String html = R"(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Robot Assistant</title>
+  <style>
+    body { background: #0f1420; color: #e6ebf5; font: 16px system-ui; margin: 0; padding: 14px; }
+    .wrap { max-width: 700px; margin: auto; }
+    h1 { margin: 0; font-size: 20px; }
+    .card { background: #192032; border: 1px solid #2a3450; border-radius: 14px; padding: 14px; margin: 12px 0; }
+    button { background: #4f8cff; color: #fff; border: 0; border-radius: 10px; padding: 10px 14px; cursor: pointer; margin: 2px; }
+    button.alt { background: #0f1626; color: #e6ebf5; border: 1px solid #2a3450; }
+    .pad { display: grid; grid-template-columns: repeat(3, 76px); gap: 8px; justify-content: center; }
+    .pad button { margin: 0; font-size: 28px; padding: 0; }
+    input, select { background: #0f1626; color: #e6ebf5; border: 1px solid #2a3450; border-radius: 8px; padding: 8px; width: 100%; margin: 4px 0; }
+    #log { font: 12px monospace; color: #8d99b3; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Robot Assistant</h1>
+    <div class="card">
+      <p>Time: <b id="t">--</b> | State: <b id="st">idle</b></p>
+    </div>
+    
+    <div class="card">
+      <h3>Voice</h3>
+      <input type="text" id="cmd" placeholder="Ask anything...">
+      <button onclick="sendCmd()">Send</button>
+    </div>
+    
+    <div class="card">
+      <h3>Drive</h3>
+      <div class="pad">
+        <span></span><button data-d="f">UP</button><span></span>
+        <button data-d="l">L</button><button data-d="s" class="alt">STOP</button><button data-d="r">R</button>
+        <span></span><button data-d="b">DN</button><span></span>
+      </div>
+    </div>
+    
+    <div class="card">
+      <h3>Log</h3>
+      <div id="log">...</div>
+    </div>
+  </div>
   
-  String pod = "<select id='podSel'>";
-  for (int i = 0; i < MAX_PODCASTS; i++) {
-    if (strlen(pods[i].url) > 0) {
-      pod += "<option value=" + String(i) + ">" + esc(pods[i].name) + "</option>";
+  <script>
+    function cmd(u) { fetch(u + '&x=1').then(r => r.text()).catch(e => {}); }
+    document.querySelectorAll('.pad button').forEach(b => {
+      const d = b.dataset.d;
+      b.addEventListener('pointerdown', e => { e.preventDefault(); cmd('/drive?d=' + d); });
+      if (d != 's') {
+        ['pointerup', 'pointerleave'].forEach(ev => b.addEventListener(ev, () => cmd('/drive?d=s')));
+      }
+    });
+    
+    function sendCmd() {
+      const c = document.getElementById('cmd').value;
+      if (c) {
+        fetch('/voice?cmd=' + encodeURIComponent(c) + '&x=1').then(r => r.text());
+        document.getElementById('cmd').value = '';
+      }
     }
-  }
-  pod += "</select>";
-  server.sendContent(pod);
+    
+    function poll() {
+      fetch('/status').then(r => r.json()).then(s => {
+        document.getElementById('t').textContent = s.time;
+        document.getElementById('st').textContent = s.state;
+        document.getElementById('log').textContent = s.log.join('\n');
+      }).catch(() => {});
+    }
+    
+    document.getElementById('cmd').addEventListener('keypress', e => {
+      if (e.key === 'Enter') { e.preventDefault(); sendCmd(); }
+    });
+    
+    poll();
+    setInterval(poll, 2000);
+  </script>
+</body>
+</html>
+  )";
   
-  server.sendContent(PAGE_END);
+  server.send(200, "text/html", html);
 }
 
 void handleDrive() {
-  if (!auth()) return;
   String d = server.arg("d");
   if (d == "f") drive(DRIVE_SPEED);
   else if (d == "b") drive(-DRIVE_SPEED);
-  else if (d == "l") { Motor_Move(-DRIVE_SPEED, -DRIVE_SPEED, DRIVE_SPEED, DRIVE_SPEED); driving=true; driveStart=millis(); }
-  else if (d == "r") { Motor_Move(DRIVE_SPEED, DRIVE_SPEED, -DRIVE_SPEED, -DRIVE_SPEED); driving=true; driveStart=millis(); }
+  else if (d == "l") { Motor_Move(-DRIVE_SPEED, -DRIVE_SPEED, DRIVE_SPEED, DRIVE_SPEED); driving = true; driveStart = millis(); }
+  else if (d == "r") { Motor_Move(DRIVE_SPEED, DRIVE_SPEED, -DRIVE_SPEED, -DRIVE_SPEED); driving = true; driveStart = millis(); }
   else motorStop();
-  redirectHome();
-}
-
-void handleStop() {
-  if (!auth()) return;
-  stopAll();
-  timerActive = false;
-  redirectHome();
-}
-
-void handleVoice() {
-  if (!auth()) return;
-  String cmd = server.arg("cmd");
-  if (cmd.length() > 0) processVoiceCommand(cmd);
   server.send(200, "text/plain", "ok");
 }
 
-void handlePlay() {
-  if (!auth()) return;
-  int i = server.arg("p").toInt();
-  if (stage != IDLE) stopAll();
-  wantPod = -1;
-  alarmStart = millis();
-  startPodcastStage(i);
-  redirectHome();
-}
-
-void handlePing() {
-  server.send(200, "text/plain", "pong");
+void handleVoice() {
+  String cmd = server.arg("cmd");
+  if (cmd.length() > 0) processVoiceCommand(cmd);
+  server.send(200, "text/plain", "ok");
 }
 
 // ========== SETUP ==========
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== Groq Robot Alarm Clock + AI Assistant ===\n");
+  Serial.println("\n=== Groq Robot Alarm Clock v9 ===\n");
 
-  pinMode(STOP_BTN_PIN, INPUT_PULLUP);
+  pinMode(0, INPUT_PULLUP);
 
-  Serial.println("[Motors] Init Freenove...");
+  Serial.println("[Motors] Init...");
   PCA9685_Setup();
   motorStop();
   Serial.println("[Motors] Ready");
@@ -650,15 +550,12 @@ void setup() {
   MDNS.begin("alarm");
 
   server.on("/status", handleStatus);
-  server.on("/ping", handlePing);
   server.on("/", handleRoot);
   server.on("/drive", handleDrive);
-  server.on("/stop", handleStop);
   server.on("/voice", handleVoice);
-  server.on("/play", handlePlay);
 
   server.begin();
-  Serial.println("\n[Server] Started\n");
+  Serial.println("[Server] Started\n");
 }
 
 // ========== LOOP ==========
@@ -669,22 +566,15 @@ void loop() {
   if (millis() - lastNet > 30000) {
     lastNet = millis();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WiFi] Lost, reconnecting...");
+      Serial.println("[WiFi] Reconnecting...");
       WiFi.disconnect();
       WiFi.begin(WIFI_SSID, WIFI_PASS);
     }
   }
 
-  static unsigned long btnDown = 0;
-  if (digitalRead(STOP_BTN_PIN) == LOW) {
-    if (!btnDown) btnDown = millis();
-    if (millis() - btnDown > 60 && stage != IDLE) stopAll();
-  } else btnDown = 0;
-
   if (stage == WAITBT) {
     int c = btConnState();
     if (c != 0 && pendingPod >= 0) {
-      if (c == 1) note("Speaker connected");
       int i = pendingPod;
       pendingPod = -1;
       beginPodcastNow(i);
@@ -707,7 +597,6 @@ void loop() {
     if (millis() - lastData > 8000) {
       stopAll();
     }
-    if (millis() - alarmStart > ALARM_MAX_MS) stopAll();
   }
 
   if (driving && millis() - driveStart > DRIVE_MS) {
@@ -715,30 +604,11 @@ void loop() {
     driving = false;
   }
 
-  if (timerActive && (long)(millis() - countdownEnd) >= 0) {
-    timerActive = false;
-    drive(DRIVE_SPEED);
-    speakThenPlay("Timer done", -1);
-  }
-
   static unsigned long lastCheck = 0;
   if (millis() - lastCheck > 1000) {
     lastCheck = millis();
     struct tm t;
     if (getLocalTime(&t, 10)) {
-      if (!audioReady) {
-        int nowMin = t.tm_hour * 60 + t.tm_min;
-        for (int i = 0; i < MAX_ALARMS; i++) {
-          Alarm& a = alarms[i];
-          if (a.enabled && a.podcast && dayMatches(a.mode, t.tm_wday)) {
-            int diff = a.hour * 60 + a.minute - nowMin;
-            if (diff >= 0 && diff <= BT_PREWARM_MIN) {
-              ensureAudio();
-              break;
-            }
-          }
-        }
-      }
       int32_t stamp = ((t.tm_year * 366) + t.tm_yday) * 1440 + t.tm_hour * 60 + t.tm_min;
       for (int i = 0; i < MAX_ALARMS; i++) {
         Alarm& a = alarms[i];
